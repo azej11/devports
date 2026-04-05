@@ -53,9 +53,10 @@ chmod +x devports
 ln -s "$(pwd)/devports" ~/.local/bin/devports
 ```
 
-### Homebrew (coming soon)
+### Homebrew
 
 ```bash
+brew tap azej11/tap
 brew install devports
 ```
 
