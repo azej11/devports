@@ -1,0 +1,379 @@
+#!/usr/bin/env zsh
+#
+# devports - See which dev servers are running on which ports
+#
+# MIT License
+#
+# Usage:
+#   devports              List dev servers (filtered to common dev ports)
+#   devports all          List ALL listening ports
+#   devports <port>       Show what's running on a specific port
+#   devports kill <port>  Kill the process on a specific port
+#   devports db [port]    List PostgreSQL databases (default: 5432)
+#   devports watch        Live-refresh dashboard every 2 seconds
+
+DEVPORTS_VERSION="1.0.0"
+
+# Dev server commands/runtimes to detect
+DEV_COMMANDS="node|next|vite|react-scripts|webpack|nuxt|angular|ng|python|flask|django|uvicorn|gunicorn|ruby|rails|puma|php|artisan|cargo|go|deno|bun|tsx|ts-node|esbuild|turbo|remix|astro|gatsby|svelte|hugo|jekyll|live-server|http-server|serve|npm|npx|yarn|pnpm"
+
+# Known system/infrastructure processes to exclude in filtered mode
+# These commonly listen on TCP ports but aren't dev servers
+SYSTEM_PROCESSES="ControlCe|rapportd|sharingd|bluetoothd|mDNSResponder|Spotify|WindowServer|loginwindow|launchd|SystemUIServer|airportd|UserEventAgent|cloudd|identityservicesd|AMPDevicesAgent|locationd|wirelessproxd|CommCenter|contextstored|coreauthd|corebrightnessd|familycircled|findmydeviced|icdd|nsurlsessiond|parentalcontrolsd|rapportd|remindd|symptomsd|trustd|ftp|sshd|cupsd|httpd|nginx|postgres|mysqld|redis-server|mongod|memcached|elasticsearch"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+get_project_dir() {
+    local pid=$1
+    local cwd=""
+    cwd=$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | grep "^n/" | sed 's/^n//' | head -1) || true
+    echo "$cwd"
+}
+
+get_project_name() {
+    local dir=$1
+    if [[ -z "$dir" ]]; then
+        echo "unknown"
+        return
+    fi
+    local check_dir="$dir"
+    while [[ "$check_dir" != "/" && -n "$check_dir" ]]; do
+        if [[ -f "$check_dir/package.json" ]]; then
+            local name=""
+            name=$(grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$check_dir/package.json" 2>/dev/null | head -1 | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || true
+            if [[ -n "$name" ]]; then
+                echo "$name"
+                return
+            fi
+        fi
+        if [[ -f "$check_dir/Cargo.toml" || -f "$check_dir/go.mod" || -f "$check_dir/pyproject.toml" || -f "$check_dir/setup.py" || -f "$check_dir/Gemfile" ]]; then
+            basename "$check_dir"
+            return
+        fi
+        check_dir=$(dirname "$check_dir")
+    done
+    basename "$dir"
+}
+
+get_framework() {
+    local cmd=$1
+    local dir=$2
+    if echo "$cmd" | grep -qiE "next"; then echo "Next.js"; return; fi
+    if echo "$cmd" | grep -qiE "vite"; then echo "Vite"; return; fi
+    if echo "$cmd" | grep -qiE "react-scripts"; then echo "CRA"; return; fi
+    if echo "$cmd" | grep -qiE "nuxt"; then echo "Nuxt"; return; fi
+    if echo "$cmd" | grep -qiE "angular|ng serve"; then echo "Angular"; return; fi
+    if echo "$cmd" | grep -qiE "webpack-dev"; then echo "Webpack"; return; fi
+    if echo "$cmd" | grep -qiE "remix"; then echo "Remix"; return; fi
+    if echo "$cmd" | grep -qiE "astro"; then echo "Astro"; return; fi
+    if echo "$cmd" | grep -qiE "gatsby"; then echo "Gatsby"; return; fi
+    if echo "$cmd" | grep -qiE "svelte"; then echo "SvelteKit"; return; fi
+    if echo "$cmd" | grep -qiE "flask"; then echo "Flask"; return; fi
+    if echo "$cmd" | grep -qiE "django|manage.py"; then echo "Django"; return; fi
+    if echo "$cmd" | grep -qiE "uvicorn"; then echo "Uvicorn"; return; fi
+    if echo "$cmd" | grep -qiE "rails|puma"; then echo "Rails"; return; fi
+    if echo "$cmd" | grep -qiE "artisan"; then echo "Laravel"; return; fi
+    if echo "$cmd" | grep -qiE "hugo"; then echo "Hugo"; return; fi
+    if echo "$cmd" | grep -qiE "turbo"; then echo "Turbo"; return; fi
+    if echo "$cmd" | grep -qiE "bun"; then echo "Bun"; return; fi
+    if echo "$cmd" | grep -qiE "deno"; then echo "Deno"; return; fi
+    if echo "$cmd" | grep -qiE "live-server|http-server|serve"; then echo "Static"; return; fi
+    if [[ -n "$dir" ]]; then
+        if [[ -f "$dir/next.config.js" || -f "$dir/next.config.mjs" || -f "$dir/next.config.ts" ]]; then echo "Next.js"; return; fi
+        if [[ -f "$dir/vite.config.js" || -f "$dir/vite.config.ts" ]]; then echo "Vite"; return; fi
+        if [[ -f "$dir/nuxt.config.js" || -f "$dir/nuxt.config.ts" ]]; then echo "Nuxt"; return; fi
+        if [[ -f "$dir/angular.json" ]]; then echo "Angular"; return; fi
+    fi
+    echo "-"
+}
+
+list_dev_servers() {
+    local show_all=${1:-false}
+    local specific_port=${2:-}
+
+    local lsof_output
+    lsof_output=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null) || true
+
+    if [[ -z "$lsof_output" ]]; then
+        echo "${YELLOW}No listening ports found.${RESET}"
+        return
+    fi
+
+    typeset -A seen_ports
+    typeset -a result_lines
+
+    local cmd pid port full_cmd dir project framework short_dir port_color
+    while IFS= read -r line; do
+        [[ "$line" =~ ^COMMAND ]] && continue
+
+        cmd=$(echo "$line" | awk '{print $1}')
+        pid=$(echo "$line" | awk '{print $2}')
+        port=$(echo "$line" | awk '{print $(NF-1)}' | grep -oE '[0-9]+$') || true
+
+        [[ -z "$port" ]] && continue
+
+        if [[ -n "$specific_port" && "$port" != "$specific_port" ]]; then
+            continue
+        fi
+
+        if [[ -n "${seen_ports[$port]:-}" ]]; then
+            continue
+        fi
+        seen_ports[$port]=1
+
+        if [[ "$show_all" == "false" && -z "$specific_port" ]]; then
+            if echo "$cmd" | grep -qiE "$SYSTEM_PROCESSES"; then
+                continue
+            fi
+            full_cmd=$(ps -o command= -p "$pid" 2>/dev/null) || full_cmd="$cmd"
+            if ! echo "$full_cmd" | grep -qiE "$DEV_COMMANDS"; then
+                if (( port < 3000 || port > 9999 )); then
+                    continue
+                fi
+            fi
+        fi
+
+        full_cmd=$(ps -o command= -p "$pid" 2>/dev/null) || full_cmd="$cmd"
+        dir=$(get_project_dir "$pid")
+        project=$(get_project_name "$dir")
+        framework=$(get_framework "$full_cmd" "$dir")
+
+        short_dir="${dir/#$HOME/~}"
+        [[ -z "$short_dir" ]] && short_dir="-"
+
+        port_color="$GREEN"
+        if (( port >= 4000 && port <= 4999 )); then port_color="$CYAN"
+        elif (( port >= 5000 && port <= 5999 )); then port_color="$BLUE"
+        elif (( port >= 8000 && port <= 9999 )); then port_color="$YELLOW"
+        fi
+
+        result_lines+=("$(printf "  ${port_color}%-7s${RESET} ${BOLD}%-22s${RESET} %-12s ${DIM}%-8s${RESET} ${DIM}%s${RESET}" \
+            "$port" "$project" "$framework" "$pid" "$short_dir")")
+    done <<< "$lsof_output"
+
+    if [[ ${#result_lines[@]} -eq 0 ]]; then
+        if [[ -n "$specific_port" ]]; then
+            echo "${YELLOW}Nothing is running on port $specific_port${RESET}"
+        else
+            echo "${YELLOW}No dev servers detected.${RESET}"
+            echo "${DIM}Use 'devports all' to show all listening ports.${RESET}"
+        fi
+        return
+    fi
+
+    echo ""
+    if [[ -n "$specific_port" ]]; then
+        echo "  ${BOLD}Port $specific_port${RESET}"
+    elif [[ "$show_all" == "true" ]]; then
+        echo "  ${BOLD}All listening ports${RESET}"
+    else
+        echo "  ${BOLD}Dev Servers${RESET}"
+    fi
+    echo "  ${DIM}──────────────────────────────────────────────────────────────────────${RESET}"
+    printf "  ${DIM}%-7s %-22s %-12s %-8s %s${RESET}\n" "PORT" "PROJECT" "FRAMEWORK" "PID" "DIRECTORY"
+    echo "  ${DIM}──────────────────────────────────────────────────────────────────────${RESET}"
+
+    for line in "${result_lines[@]}"; do
+        echo "$line"
+    done
+
+    echo "  ${DIM}──────────────────────────────────────────────────────────────────────${RESET}"
+    echo "  ${DIM}${#result_lines[@]} server(s) found${RESET}"
+    echo ""
+}
+
+kill_port() {
+    local port=$1
+    local pid=""
+    pid=$(lsof -ti TCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1) || true
+
+    if [[ -z "$pid" ]]; then
+        echo "${YELLOW}Nothing is running on port $port${RESET}"
+        return 1
+    fi
+
+    local cmd=""
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null) || cmd="unknown"
+    local dir=""
+    dir=$(get_project_dir "$pid")
+    local project=""
+    project=$(get_project_name "$dir")
+
+    echo "${RED}Killing${RESET} process on port ${BOLD}$port${RESET}"
+    echo "  Project: ${BOLD}$project${RESET}"
+    echo "  PID:     $pid"
+    echo "  Command: ${DIM}$cmd${RESET}"
+
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "${YELLOW}Process didn't stop gracefully, force killing...${RESET}"
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    echo "${GREEN}Done.${RESET}"
+}
+
+find_psql() {
+    local candidates=(
+        "psql"
+        "/opt/homebrew/opt/postgresql@17/bin/psql"
+        "/opt/homebrew/opt/postgresql@16/bin/psql"
+        "/opt/homebrew/opt/postgresql@15/bin/psql"
+        "/opt/homebrew/opt/libpq/bin/psql"
+        "/usr/local/opt/postgresql@17/bin/psql"
+        "/usr/local/opt/postgresql@16/bin/psql"
+        "/usr/local/opt/postgresql@15/bin/psql"
+        "/usr/local/opt/libpq/bin/psql"
+        "/usr/local/bin/psql"
+        "/usr/bin/psql"
+    )
+    for c in "${candidates[@]}"; do
+        if command -v "$c" &>/dev/null || [[ -x "$c" ]]; then
+            echo "$c"
+            return
+        fi
+    done
+    echo ""
+}
+
+list_databases() {
+    local port=${1:-5432}
+
+    local pg_pid=""
+    pg_pid=$(lsof -ti TCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1) || true
+    if [[ -z "$pg_pid" ]]; then
+        echo "${YELLOW}No PostgreSQL server found on port $port${RESET}"
+        return 1
+    fi
+
+    local psql_bin
+    psql_bin=$(find_psql)
+    if [[ -z "$psql_bin" ]]; then
+        echo "${RED}psql not found. Install PostgreSQL client or add it to PATH.${RESET}"
+        return 1
+    fi
+
+    local db_output
+    db_output=$("$psql_bin" -h localhost -p "$port" -U "$USER" -d postgres -t -A -F $'\t' \
+        -c "SELECT d.datname, pg_catalog.pg_get_userbyid(d.datdba), pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)), (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE pg_stat_activity.datname = d.datname) FROM pg_catalog.pg_database d WHERE d.datistemplate = false ORDER BY pg_catalog.pg_database_size(d.datname) DESC;" 2>&1) || true
+
+    if [[ -z "$db_output" || "$db_output" == *"connection refused"* || "$db_output" == *"could not connect"* ]]; then
+        echo "${YELLOW}Could not connect to PostgreSQL on port $port${RESET}"
+        echo "${DIM}$db_output${RESET}"
+        return 1
+    fi
+
+    echo ""
+    echo "  ${BOLD}PostgreSQL Databases${RESET} ${DIM}(port $port)${RESET}"
+    echo "  ${DIM}──────────────────────────────────────────────────────${RESET}"
+    printf "  ${DIM}%-20s %-16s %-10s %s${RESET}\n" "DATABASE" "OWNER" "SIZE" "CONNECTIONS"
+    echo "  ${DIM}──────────────────────────────────────────────────────${RESET}"
+
+    local count=0
+    while IFS=$'\t' read -r dbname owner size connections; do
+        [[ -z "$dbname" ]] && continue
+        local name_color="$GREEN"
+        if [[ "$dbname" == "postgres" ]]; then
+            name_color="$DIM"
+        fi
+        printf "  ${name_color}%-20s${RESET} %-16s %-10s %s\n" "$dbname" "$owner" "$size" "$connections"
+        ((count++))
+    done <<< "$db_output"
+
+    echo "  ${DIM}──────────────────────────────────────────────────────${RESET}"
+    echo "  ${DIM}${count} database(s)${RESET}"
+
+    while IFS=$'\t' read -r dbname owner size connections; do
+        [[ -z "$dbname" || "$dbname" == "postgres" ]] && continue
+
+        local tables
+        tables=$("$psql_bin" -h localhost -p "$port" -U "$USER" -d "$dbname" -t -A -F $'\t' \
+            -c "SELECT tablename, pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) FROM pg_tables WHERE schemaname = 'public' ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC LIMIT 10;" 2>/dev/null) || true
+
+        if [[ -n "$tables" ]]; then
+            echo ""
+            echo "  ${CYAN}$dbname${RESET} tables:"
+            while IFS=$'\t' read -r tname tsize; do
+                [[ -z "$tname" ]] && continue
+                printf "    ${DIM}%-30s %s${RESET}\n" "$tname" "$tsize"
+            done <<< "$tables"
+        fi
+    done <<< "$db_output"
+
+    echo ""
+}
+
+watch_servers() {
+    while true; do
+        clear
+        echo "${DIM}$(date '+%H:%M:%S') — Press Ctrl+C to exit${RESET}"
+        list_dev_servers false
+        sleep 2
+    done
+}
+
+# --- Main ---
+case "${1:-}" in
+    ""|ls|list)
+        list_dev_servers false
+        ;;
+    all)
+        list_dev_servers true
+        ;;
+    db)
+        list_databases "${2:-5432}"
+        ;;
+    kill|stop)
+        if [[ -z "${2:-}" ]]; then
+            echo "${RED}Usage: devports kill <port>${RESET}"
+            exit 1
+        fi
+        kill_port "$2"
+        ;;
+    watch|w)
+        watch_servers
+        ;;
+    -v|--version|version)
+        echo "devports $DEVPORTS_VERSION"
+        ;;
+    help|-h|--help)
+        echo ""
+        echo "  ${BOLD}devports${RESET} v${DEVPORTS_VERSION} — See what's running on your dev ports"
+        echo ""
+        echo "  ${BOLD}Usage:${RESET}"
+        echo "    ${GREEN}devports${RESET}              List dev servers (auto-filters system processes)"
+        echo "    ${GREEN}devports all${RESET}           List ALL listening ports"
+        echo "    ${GREEN}devports <port>${RESET}        Show what's on a specific port"
+        echo "    ${GREEN}devports kill <port>${RESET}   Kill the process on a port"
+        echo "    ${GREEN}devports db [port]${RESET}     List PostgreSQL databases (default: 5432)"
+        echo "    ${GREEN}devports watch${RESET}         Live-refresh dashboard (2s interval)"
+        echo ""
+        echo "  ${BOLD}How it works:${RESET}"
+        echo "    Scans listening TCP ports via lsof, resolves each process to its"
+        echo "    working directory, detects the project name (from package.json,"
+        echo "    Cargo.toml, go.mod, etc.) and identifies the framework in use."
+        echo ""
+        echo "  ${BOLD}Requirements:${RESET}"
+        echo "    macOS or Linux with zsh and lsof"
+        echo "    PostgreSQL client (psql) for the db command"
+        echo ""
+        ;;
+    *)
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            list_dev_servers false "$1"
+        else
+            echo "${RED}Unknown command: $1${RESET}"
+            echo "Run 'devports help' for usage."
+            exit 1
+        fi
+        ;;
+esac
